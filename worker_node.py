@@ -21,6 +21,9 @@ NDTwin core contributors (as of January 15, 2026):
     Mr. Zhen-Rong Wu <National Taiwan Normal University>
     Mr. Ting-En Chang <University of Wisconsin, Milwaukee>
     Mr. Yu-Cheng Chen <National Yang Ming Chiao Tung University>
+
+The worker node which receive flow generation requests from controller and 
+manage iperf3 processes.
 """
 import asyncio
 import json
@@ -135,6 +138,19 @@ def _mark_finished_receiver_port(job: 'JobStatus') -> None:
             pass
 
 def _new_job(role: Literal["sender", "receiver"], cmd: List[str], result_path: str, ip: Optional[str] = None, port: Optional[int] = None, start_t: Optional[float] = None) -> JobStatus:
+    """Create a new job entry and register it in the global JOBS dictionary.
+    
+    Args:
+        role: Either 'sender' (iperf client) or 'receiver' (iperf server).
+        cmd: The iperf command to execute.
+        result_path: File path to store the JSON output.
+        ip: Logical host name (e.g., 'h1') for receiver jobs.
+        port: Port number for receiver jobs.
+        start_t: Optional start timestamp; defaults to current time.
+    
+    Returns:
+        JobStatus object representing the newly created job.
+    """
     job_id = uuid.uuid4().hex
     js = JobStatus(
         job_id=job_id, role=role, pid=None, cmd=cmd,
@@ -147,6 +163,13 @@ def _new_job(role: Literal["sender", "receiver"], cmd: List[str], result_path: s
     return js
 
 async def _terminate_proc(job_id: str, reason: str = "server_shutdown", timeout: float = 2.0):
+    """Gracefully terminate a running iperf process, falling back to kill if needed.
+    
+    Args:
+        job_id: The unique identifier of the job to terminate.
+        reason: Description of why the process is being stopped (for logging).
+        timeout: Max seconds to wait for graceful termination before force kill.
+    """
     job = JOBS.get(job_id)
     proc = PROCS.get(job_id)
 
@@ -187,7 +210,16 @@ RECEIVER_EXECUTOR = ThreadPoolExecutor(max_workers=MAX_RECEIVER_CONCURRENCY)
 
 
 def _start_subprocess_and_wait(cmd: List[str], job_id: str ,re = False) -> tuple:
-    """Start a subprocess and wait for it to complete."""
+    """Start an iperf subprocess and block until it completes.
+    
+    Args:
+        cmd: The command line arguments to execute.
+        job_id: The job identifier for tracking the process.
+        re: Reserved flag (currently unused).
+    
+    Returns:
+        Tuple of (return_code, stdout, stderr) from the subprocess.
+    """
     try:
         process = subprocess.Popen(
             cmd,
@@ -209,7 +241,18 @@ def _start_subprocess_and_wait(cmd: List[str], job_id: str ,re = False) -> tuple
         return -1, "", str(e)
 
 def _json_text_mentions_eagain(out: Optional[str], err: Optional[str]) -> bool:
-    """Detect EAGAIN-like errors in captured stdout/stderr or JSON 'error' field."""
+    """Detect transient errors (EAGAIN, connection refused) in iperf output.
+    
+    These errors indicate temporary resource unavailability and are candidates
+    for retry. Checks both raw text output and JSON 'error' field.
+    
+    Args:
+        out: Captured stdout from iperf process.
+        err: Captured stderr from iperf process.
+    
+    Returns:
+        True if a transient error is detected, False otherwise.
+    """
     text = (out or "") + "\n" + (err or "")
     markers = (
         "Resource temporarily unavailable",
@@ -233,17 +276,49 @@ def _json_text_mentions_eagain(out: Optional[str], err: Optional[str]) -> bool:
     return False
 
 def _cmd_has_one_off(cmd: List[str]) -> bool:
-    """Detect if the receiver command uses --one-off (-1)."""
+    """Check if the iperf server command has the one-off flag (-1 or --one-off).
+    
+    When one-off is enabled, the server exits after handling a single client.
+    
+    Args:
+        cmd: The iperf command arguments list.
+    
+    Returns:
+        True if one-off mode is enabled, False otherwise.
+    """
     return ("-1" in cmd) or ("--one-off" in cmd)
 
 def _start_receiver_with_persistence(cmd: List[str], job_id: str) -> tuple:
+    """Start an iperf receiver (server) in one-off mode.
+    
+    This wrapper is used for receivers that handle a single client connection
+    and then exit. It delegates to the standard subprocess runner.
+    
+    Args:
+        cmd: The iperf server command arguments.
+        job_id: The job identifier for tracking.
+    
+    Returns:
+        Tuple of (return_code, stdout, stderr) from the subprocess.
+    """
     attempt = 0
     rc, out, err = _start_subprocess_and_wait(cmd, job_id, (attempt>1))
     return rc, out, err
 
 
 def _start_subprocess_and_wait_with_retry(cmd: List[str], job_id: str) -> tuple:
-    """Run iperf3 with limited retries if EAGAIN occurs. Runs synchronously in a worker thread."""
+    """Run iperf with automatic retry on transient failures (EAGAIN, connection refused).
+    
+    Implements exponential backoff between retries. This is especially useful
+    for sender processes that may fail due to server not being ready yet.
+    
+    Args:
+        cmd: The iperf command arguments.
+        job_id: The job identifier for tracking.
+    
+    Returns:
+        Tuple of (return_code, stdout, stderr) from the final attempt.
+    """
     attempts = max(1,  RETRIES + 1)
     last_rc, last_out, last_err = -1, "", ""
     for i in range(attempts):
@@ -312,6 +387,20 @@ def _start_receiver_with_timeout(cmd: List[str], job_id: str, fixed_traffic_dura
 
 # ------------------------- Runner -------------------------
 async def _run_and_capture_json(job_id: str, cmd: List[str], sem: asyncio.Semaphore, fixed_traffic_duration: Optional[int] = None, wait_offset: Optional[float] = 0.0, test_time: Optional[float] = None):
+    """Execute an iperf job asynchronously and save the JSON output to file.
+    
+    This is the main runner that handles both varied traffic (single run) and
+    fixed traffic (continuous runs for a specified duration). Results are
+    written to the job's result_path upon completion.
+    
+    Args:
+        job_id: Unique identifier for this job.
+        cmd: The iperf command to execute.
+        sem: Semaphore for concurrency control.
+        fixed_traffic_duration: If set, run continuously for this many seconds.
+        wait_offset: Extra time buffer for receiver to wait (used with fixed_traffic).
+        test_time: Optional timestamp for logging/tracking purposes.
+    """
     async with sem:
         rc = -1
         stdout = ""
@@ -402,7 +491,17 @@ async def _run_and_capture_json(job_id: str, cmd: List[str], sem: asyncio.Semaph
 # ------------------------- Endpoints -------------------------
 @app.post("/flow/sender", response_model=List[str])
 async def start_senders(reqs: SenderReqs):
+    """API endpoint to start one or more iperf sender (client) flows.
     
+    Each sender connects to a specified server address and port to generate
+    network traffic. Supports TCP/UDP, rate limiting, size limits, and duration.
+    
+    Args:
+        reqs: List of SenderReq objects containing flow parameters.
+    
+    Returns:
+        List of job IDs for the started sender flows.
+    """
     jobs = []
     
     async def _start_single_sender(req: SenderReq):
@@ -443,7 +542,17 @@ async def start_senders(reqs: SenderReqs):
 
 @app.post("/flow/receiver", response_model=List[str])
 async def start_receivers(reqs: ReceiverReqs):
-
+    """API endpoint to start one or more iperf receiver (server) instances.
+    
+    Each receiver listens on a specified port and waits for incoming client
+    connections. Supports TCP/UDP and one-off mode (exit after single client).
+    
+    Args:
+        reqs: List of ReceiverReq objects containing server parameters.
+    
+    Returns:
+        List of job IDs for the started receiver instances.
+    """
     jobs = []
 
     async def _start_single_receiver(req: ReceiverReq):
@@ -479,17 +588,41 @@ async def start_receivers(reqs: ReceiverReqs):
 
 @app.get("/flow/finished_ports", response_model=Dict[str, List[int]])
 async def get_finished_ports():
-    """Get finished receiver ports from in-memory dictionary and clear it."""
+    """API endpoint to retrieve and clear finished receiver ports.
+    
+    Returns a mapping of host IPs to their completed port numbers. This allows
+    the NTG controller to recycle ports for new flows. The internal dictionary
+    is cleared after each call.
+    
+    Returns:
+        Dict mapping host IP (e.g., 'h1') to list of finished port numbers.
+    """
     result = {ip: sorted(list(ports)) for ip, ports in FINISHED_PORTS.items()}
     FINISHED_PORTS.clear()
     return result
 
 @app.get("/jobs", response_model=List[JobStatus])
 async def list_jobs():
+    """API endpoint to list all jobs (running, finished, failed, stopped).
+    
+    Returns:
+        List of JobStatus objects for all tracked jobs.
+    """
     return list(JOBS.values())
 
 @app.get("/jobs/{job_id}", response_model=JobStatus)
 async def get_job(job_id: str):
+    """API endpoint to get status of a specific job by its ID.
+    
+    Args:
+        job_id: The unique identifier of the job to query.
+    
+    Returns:
+        JobStatus object with job details.
+    
+    Raises:
+        HTTPException: 404 if job_id is not found.
+    """
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
@@ -497,6 +630,19 @@ async def get_job(job_id: str):
 
 @app.post("/jobs/{job_id}/stop", response_model=JobStatus)
 async def stop_job(job_id: str):
+    """API endpoint to manually stop a running job.
+    
+    Gracefully terminates the iperf process associated with the job.
+    
+    Args:
+        job_id: The unique identifier of the job to stop.
+    
+    Returns:
+        Updated JobStatus object after stopping.
+    
+    Raises:
+        HTTPException: 404 if job_id is not found.
+    """
     job = JOBS.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="job not found")
@@ -509,6 +655,13 @@ async def stop_job(job_id: str):
 
 @app.post("/jobs/stop_all", response_model=bool)
 async def stop_all_jobs():
+    """API endpoint to stop all currently running jobs.
+    
+    Terminates all active iperf processes. Useful for cleanup or emergency stop.
+    
+    Returns:
+        True when all jobs have been signaled to stop.
+    """
     running_ids = [jid for jid, j in JOBS.items() if j.status == "running"]
     logger.warning(f"[stop_all] stopping {len(running_ids)} running jobs")
     await asyncio.gather(*[_terminate_proc(jid, "manual_stop_all") for jid in running_ids], return_exceptions=True)
@@ -517,6 +670,11 @@ async def stop_all_jobs():
 
 @app.get("/health")
 async def health():
+    """API endpoint to check server health and get running job count.
+    
+    Returns:
+        Dict with 'ok' status, 'inflight' running job count, and 'results_dir' path.
+    """
     running = sum(1 for j in JOBS.values() if j.status == "running")
     return {"ok": True, "inflight": running, "results_dir": os.path.abspath(RESULT_DIR)}
 
@@ -524,6 +682,11 @@ async def health():
 # ------------------------- Lifecycle -------------------------
 @app.on_event("shutdown")
 async def _on_shutdown():
+    """Cleanup handler called when the FastAPI server is shutting down.
+    
+    Terminates all running iperf processes, waits for async tasks to flush,
+    and shuts down the thread pool executors to ensure clean exit.
+    """
     running_ids = [jid for jid, j in JOBS.items() if j.status == "running"]
     logger.warning(f"[shutdown] stopping {len(running_ids)} running jobs")
     await asyncio.gather(*[_terminate_proc(jid, "server_shutdown") for jid in running_ids], return_exceptions=True)
