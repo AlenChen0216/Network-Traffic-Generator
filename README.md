@@ -64,6 +64,15 @@ Hardware_Testbed:
   data:
     ndtwin_server: "http://10.10.xx.xx:8000"
     recycle_interval: 10
+    sleep_time:
+      min: 0.4
+      max: 1.3
+    ports_limitation:
+      min_port: 5204
+      max_port: 10204
+      exclude_ports:
+        - 8000
+    log_level: "DEBUG"
 
 worker_node1:
   hostname: 10.10.xx.xx
@@ -74,6 +83,10 @@ worker_node1:
     - worker_node_servers
   data:
     worker_node_server: "http://10.10.xx.xx:8000"
+    retries: 5
+    backoff_min_ms: 250.0
+    backoff_max_ms: 500.0
+    thread_count: 500
     on_site_hosts:
       h1: "192.168.yy.yy"
       # ... continue for h2–hzz
@@ -84,8 +97,17 @@ worker_node1:
 Notes:
 - `ndtwin_server` is the location of our NDTwin controller.
 - `recycle_interval` is the interval for asking whether `worker_node_server` have finished some iperf3 and recycle the used ports.
+- `sleep_time` defines the random waiting interval (in seconds) between starting iperf server and client to avoid "Connection Refused". `min` and `max` set the lower and upper bounds.
+- `ports_limitation` controls the port range used for flow generation:
+  - `min_port`: The minimum port number available for iperf flows.
+  - `max_port`: The maximum port number available for iperf flows.
+  - `exclude_ports`: A list of ports to exclude from the available range (e.g., ports used by other services like the API server).
+- `log_level` sets the logging verbosity. Supported values: `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`.
 - `groups` must be a YAML list (e.g., `- worker_node_servers`).
 - `data.worker_node_server` must be reachable from the machine running `interactive_commands.py`.
+- `retries` specifies the number of retry attempts for worker nodes to restart iperf client.
+- `backoff_min_ms` and `backoff_max_ms` define the minimum and maximum backoff time (in milliseconds) between retry attempts.
+- `thread_count` sets the maximum number of concurrent threads for starting iperf client/server on each worker node.
 - `data.on_site_hosts` maps logical host names (e.g., h1) to IP addresses. If you define lots of hosts in one worker node, please list all of them.
 - Our NTG will distribute the role of client/server in iperf using the logical host names from the **NDTwin Controller**. Thus, please make sure the logical host name is the same in **NDTwin Controller** and **NTG**.
 
@@ -97,11 +119,17 @@ Mininet_Testbed:
   data:
     ndtwin_server: "http://127.0.0.1:8000"
     mode: "cli"
+    log_level: "DEBUG"
+    sleep_time:
+      min: 0.4
+      max: 1.3
 ```
 
 Notes:
 
 - `mode` can be `cli` (Mininet's CLI) or `custom_command` (our generator's cli)
+- `log_level` sets the logging verbosity. Supported values: `TRACE`, `DEBUG`, `INFO`, `WARNING`, `ERROR`.
+- `sleep_time` defines the random waiting interval (in seconds) between starting iperf server and client to avoid "Connection Refused". `min` and `max` set the lower and upper bounds.
 - **When using it, please make sure that Mininet is on you're machine.**
 
 ## Flow Generation Configuration
