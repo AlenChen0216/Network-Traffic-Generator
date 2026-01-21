@@ -594,7 +594,6 @@ def probability_assignment(current_traffic_config,is_dynamic=True,type_to_parame
     else:
         return distance_assignment,type_assignment,current_traffic_config.get('flow_parameters', DEFAULT_FLOW_PARAMETERS)
 
-#TODO the config file is chaned, need to update the function
 async def _handle_flow_command(net, args):
     """
     Handle the 'flow' command to execute traffic generation from a JSON configuration.
@@ -872,7 +871,6 @@ async def _handle_flow_command(net, args):
         logger.warning("Experiment interrupted by user.")
         await ending_process(net)
 
-#TODO : fix the logger.
 async def _handle_dist_command(net, args):
     """
     Handle the 'dist' command to execute distribution-based traffic generation.
