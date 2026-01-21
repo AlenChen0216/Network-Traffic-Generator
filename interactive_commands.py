@@ -384,21 +384,27 @@ def link_relationship_init(ndtwin_server=None):
     logger.info("Waiting to compute all link relationships...")
     try:
         while True:
-            CONNECTIONS,HOSTS = distance_partition(ndtwin_server=ndtwin_server)
+            CONNECTIONS,HOSTS,error = distance_partition(ndtwin_server=ndtwin_server)
             if CONNECTIONS is False and HOSTS is False:
-                logger.warning("Failed to get link relationships, retrying...")
+                logger.warning(f"{error}, retrying...")
                 time.sleep(2)
             else:
                 logger.info("Link relationships computed successfully.")
-                logger.debug(f"Connection relationships: {HOSTS}")
+                logger.debug(f"Connection relationships: {CONNECTIONS}")
                 break
-    except Exception as e:
-        logger.warning(e)
+    except KeyboardInterrupt:
+        logger.warning("Interrupted while computing link relationships.")
+        logger.warning("Existing...")
+        NTG_CONFIG.run(task=execute_command,mode=2)
+        exit(1)
+        
         # === You can customize default connections here ===
 
-        for i in range(32):
-            CONNECTIONS['middle'].append({'src': {"name":f"h{i+1}"}, 'dst': {"name":f"h{(i+64)+1}"}})
-            CONNECTIONS['far'].append({'src': {"name":f"h{i+1}"}, 'dst': {"name":f"h{(i+96)+1}"}})
+        # CONNECTIONS = {"near":[],"middle":[],"far":[]}
+        # HOSTS = {}
+        # for i in range(32):
+        #     CONNECTIONS['middle'].append({'src': {"name":f"h{i+1}"}, 'dst': {"name":f"h{(i+64)+1}"}})
+        #     CONNECTIONS['far'].append({'src': {"name":f"h{i+1}"}, 'dst': {"name":f"h{(i+96)+1}"}})
 
         # =======================================================
 

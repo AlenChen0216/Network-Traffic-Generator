@@ -77,7 +77,7 @@ def distance_partition(hosts = None, ndtwin_server=None):
         hosts = get_hosts()
     
     if -1 in hosts:
-        return False,False
+        return False,False,"Failed to get hosts from NDTwin server."
     
     unique_paths = {}
 
@@ -95,7 +95,9 @@ def distance_partition(hosts = None, ndtwin_server=None):
         raise ConnectionError("NDTwin Server not up...")
     
     # partition the paths
-
+    if not unique_paths:
+        return False,False,"Failed to get paths from NDTwin server."
+    
     unique_paths = {k:unique_paths[k] for k in sorted(unique_paths)}
 
 
@@ -109,7 +111,7 @@ def distance_partition(hosts = None, ndtwin_server=None):
         partition[par].extend(segments)
         start = point
     
-    return partition,hosts
+    return partition,hosts,"success"
 
 
 def CC(x):
