@@ -19,7 +19,7 @@ This guide explains how to use commands in our **Network Traffic Generator(NTG)*
 - `Utilis/`: Contains some related util functions.
 - `setting/Hardware.yaml`: Nornir host inventory (testbed controller + worker nodes + on-site host IPs).
 - `setting/API_server_startup.yaml`: Nornir group file (startup/shutdown commands for worker-node API servers).
-- `setting/Mininet.yaml`: Mininet runtime mode and local ndtwin server (basic metadata).
+- `setting/Mininet.yaml`: Mininet runtime mode and local ndtwin kernel (basic metadata).
 - `NTG.yaml`: Nornir configuration pointing to the inventory files above.
 - `flow_template.json` & `dist_template.json`: Example configuration for intervals and flow generation parameters.
 
@@ -96,7 +96,7 @@ worker_node1:
 ```
 
 Notes:
-- `ndtwin_kernel` is the location of our NDTwin controller.
+- `ndtwin_kernel` is the location of our NDTwin Kernel.
 - `recycle_interval` is the interval for asking whether `worker_node_server` have finished some iperf3 and recycle the used ports.
 - `sleep_time` defines the random waiting interval (in seconds) between starting iperf server and client to avoid "Connection Refused". `min` and `max` set the lower and upper bounds.
 - `ports_limitation` controls the port range used for flow generation:
@@ -110,7 +110,7 @@ Notes:
 - `backoff_min_ms` and `backoff_max_ms` define the minimum and maximum backoff time (in milliseconds) between retry attempts.
 - `thread_count` sets the maximum number of concurrent threads for starting iperf client/server on each worker node.
 - `data.on_site_hosts` maps logical host names (e.g., h1) to IP addresses. If you define lots of hosts in one worker node, please list all of them.
-- Our NTG will distribute the role of client/server in iperf using the logical host names from the **NDTwin Controller**. Thus, please make sure the logical host name is the same in **NDTwin Controller** and **NTG**.
+- Our NTG will distribute the role of client/server in iperf using the logical host names from the **NDTwin Kernel**. Thus, please make sure the logical host name is the same in **NDTwin Kernel** and **NTG**.
 
 `setting/Mininet.yaml`
 
@@ -385,7 +385,7 @@ sudo python ./topo.py
 4. Start the NDTwin.
 
 ```bash
-sudo bin/ndt_main
+sudo bin/NDTwin_Kernel
 ```
 ![ndtwin](./document_picture/ndtwin.png)
 
@@ -412,7 +412,7 @@ ryu-manager intelligent_router.py ryu.app.rest_topology ryu.app.ofctl_rest --ofp
 2. Start the NDTwin
 
 ```bash
-sudo bin/ndt_main
+sudo bin/NDTwin_Kernel
 ```
 
 3. Start the NTG

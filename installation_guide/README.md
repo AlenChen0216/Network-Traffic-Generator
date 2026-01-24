@@ -104,7 +104,7 @@ After that, you can follow the [NTG User Manual](../README.md) to generate flows
 
 ## NTG for Hardware Testbed
 
-For hardware testbed, we use **master and worker** architecture to generate flows. Thus, you need to prepare some machines running in **Linux** and install python libraries as below and **move `network_traffic_generator_worker_node.py` into those machines**:
+For hardware testbed, we use **master and worker** architecture to generate flows. Thus, you need to prepare some machines running in **Linux and install python libraries** as below and **move `network_traffic_generator_worker_node.py` into those machines**:
 
 - `fastapi`
 - `uvicorn` (used to start the API server)
@@ -118,4 +118,3 @@ pip install fastapi "uvicorn[standard]" pydantic loguru orjson
 ```
 
 Also, you need to make sure NTG can connect to those worker nodes.
-
