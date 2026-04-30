@@ -1115,7 +1115,11 @@ async def _handle_dist_command(net, args):
                         parameters = {}
 
                         if '-t' in type_assignment[i]:
-                            parameters['-t'] = float(t_values[t_cursor])
+                            t_tmp = float(t_values[t_cursor])
+                            #WARNING: currently change to 1.0, in real case, need to follow t_value.
+                            if t_tmp < 1.0:
+                                t_tmp = 1.0
+                            parameters['-t'] = t_tmp
                             t_cursor += 1
 
                         if '-n' in type_assignment[i]:
@@ -1201,7 +1205,10 @@ async def _handle_dist_command(net, args):
                         parameters = {}
 
                         if '-t' in type_assignment[i]:
-                            parameters['-t'] = float(t_values[t_cursor])
+                            #WARNING: currently change to 1.0, in real case, need to follow t_value.
+                            if t_tmp < 1.0:
+                                t_tmp = 1.0
+                            parameters['-t'] = t_tmp
                             t_cursor += 1
 
                         if '-n' in type_assignment[i]:
