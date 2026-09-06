@@ -2,6 +2,27 @@
 worker_node_servers:
   data:
     startup_commands:
+      - "killall -9 uvicorn"
       - "ulimit -n 1048576 && source ~/ntg/bin/activate && cd Desktop/NTG && pwd && nohup uvicorn network_traffic_generator_worker_node:app --host 0.0.0.0 --port 8000 > uvi.log 2>&1 &"
     shutdown_commands:
       - "killall -9 uvicorn"
+
+cpu_recorder_servers:
+  data:
+    cpu_recorder_command: "sudo -n -- /usr/bin/python3 /opt/get_cpu/cpu_recorder.py --config /opt/get_cpu/config.json"
+
+get_recv_pkt:
+  data:
+    get_recv_pkt_url: "http://10.10.10.250:8000/ndt/get_received_pkts"
+
+get_smartnic_recv_pkt:
+  data:
+    get_recv_pkt_url: "http://10.10.10.30:8000/rx"
+
+get_p4_send_pkt:
+  data:
+    p4_switch_address: "10.10.10.28:50052"
+    p4_dev_ports:
+      - 156
+      - 157
+    p4_client_id: 99

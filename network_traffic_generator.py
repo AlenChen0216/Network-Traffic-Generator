@@ -6,13 +6,17 @@ from datetime import datetime
 import random
 import asyncio
 import os
+import subprocess
+import threading
 from typing import Any, Dict, List, Optional, Set, Tuple, Union
 from loguru import logger
 import json
 import pandas as pd
 import numpy as np
+import requests
 import sys
 import signal
+import shutil
 
 try:
     from mininet.cli import CLI
@@ -20,7 +24,7 @@ except ImportError:
     CLI = None
 
 from Utilis.distance_seperate import distance_partition
-from Utilis.command_utils import _create_exp_dir, fast_random_choice, collect_api_info, file_checker, execute_command
+from Utilis.command_utils import _create_exp_dir, fast_random_choice, collect_api_info, file_checker, execute_command, record_cpu_usage
 from Utilis.communicator import MininetCommunicator, APICommunicator
 
 from nornir import InitNornir
@@ -65,7 +69,7 @@ class ConcateCompleter(Completer):
     A custom auto-completer that combines nested command completion with path completion.
     
     This completer provides contextual auto-completion for the NTG command prompt.
-    It switches between command completion (for 'dist', 'flow', 'exit' commands)
+    It switches between command completion (for 'dist', 'flow', 'exp', 'exit' commands)
     and file path completion (when '--config' argument is detected).
     
     Attributes:
@@ -78,13 +82,14 @@ class ConcateCompleter(Completer):
         """
         Initialize the ConcateCompleter with path and nested command completers.
         
-        Sets up the command structure for 'dist', 'flow', and 'exit' commands,
+        Sets up the command structure for 'dist', 'flow', 'exp', and 'exit' commands,
         and initializes the path completer for config file selection.
         """
         self.path_completer = PathCompleter()
         self.completer =  NestedCompleter.from_nested_dict({
             "dist": {"--config":None},
             "flow": {"--config": None},
+            "exp" : {"--config": None},
             "exit" : None,
         })
         self.config_start_position = -1
@@ -126,6 +131,9 @@ LOCK = asyncio.Lock()
 CMD_LOCK = asyncio.Lock()
 RECYCLE_STOP_EVENT = asyncio.Event()
 
+CPU_RECORDER_THREADS = []
+CPU_RECORDER_RESULTS = {}
+
 INTERFACE = None
 NTG_CONFIG = None
 
@@ -134,6 +142,9 @@ IPERF = "iperf3"  # check whether user want to use iperf3 or iperf2
 DEFAULT_FLOW_DIR = './flow_logs' # prefix of place to store output file
 FLOW_DIR = '' # place to store iperf output file, will automatically create unique dir
 FILL_WIDTH = 0
+
+PACKET_COUNTER_INTERVAL_SECONDS = 1.0
+PACKET_COUNTER_TIMEOUT_SECONDS = 0.5
 
 PORT_DISCOVERY_CMD = (
     "python3 -c 'import socket; s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); "
@@ -174,6 +185,9 @@ DEFAULT_FLOW_PARAMETERS = {
 
 TCP_SOCKET_WRITE_LENGTH = "10K"  # in bytes, not including header, only payload, can use K for 1024 bytes, M for 1024*1024 bytes, etc.
 UDP_PACKET_LENGTH = "1460"  # in bytes, not including header, only payload, can use K for 1024 bytes, M for 1024*1024 bytes, etc.
+
+#TODO: remove the related host_name_map if that one's ssh failed.
+#TODO: remove the link contain this host.
 
 def get_hardware_server_info(filtered_nornir:Nornir) -> Optional[Dict[str,Any]]:
     """
@@ -217,6 +231,252 @@ def get_hardware_server_info(filtered_nornir:Nornir) -> Optional[Dict[str,Any]]:
     else:
         return None
 
+def _start_cpu_recorders(start_time: str, redirect_dir: str = "./cpu_records") -> None:
+    """Start one get_cpu thread for every configured recorder host."""
+    global CPU_RECORDER_THREADS, CPU_RECORDER_RESULTS
+
+    CPU_RECORDER_THREADS = []
+    CPU_RECORDER_RESULTS = {}
+    recorder_hosts = NTG_CONFIG.filter(
+        F(groups__contains="cpu_recorder_servers")
+    ).inventory.hosts.values()
+
+    for host in recorder_hosts:
+        thread = threading.Thread(
+            target=record_cpu_usage,
+            args=(host, start_time, CPU_RECORDER_RESULTS, redirect_dir),
+            name=f"cpu-recorder-{host.name}",
+        )
+        thread.start()
+        CPU_RECORDER_THREADS.append(thread)
+        logger.info(f"Started CPU recorder thread for {host.name}")
+
+def _join_cpu_recorders() -> None:
+    """Wait for active get_cpu threads and report their results."""
+    global CPU_RECORDER_THREADS, CPU_RECORDER_RESULTS
+
+    for thread in CPU_RECORDER_THREADS:
+        thread.join()
+
+    for host_name, result in CPU_RECORDER_RESULTS.items():
+        if result["status"] == "success":
+            logger.info(f"Downloaded CPU records from {host_name}: {result['files']}")
+        else:
+            logger.warning(f"CPU recorder failed on {host_name}: {result['error']}")
+
+    CPU_RECORDER_THREADS = []
+    CPU_RECORDER_RESULTS = {}
+
+def _get_ndtwin_packet_counters() -> Optional[Tuple[str, Dict[str, int]]]:
+    """Retrieve received and dropped packet counters from the NDTwin host."""
+    hosts = NTG_CONFIG.filter(
+        F(groups__contains="get_recv_pkt")
+    ).inventory.hosts.values()
+
+    for host in hosts:
+        try:
+            response = requests.get(
+                host.get("get_recv_pkt_url"),
+                timeout=PACKET_COUNTER_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            counters = response.json()
+            return host.name, {
+                "recv_pkts": int(counters["recv_pkts"]),
+                "drop_pkts": int(counters["drop_pkts"]),
+            }
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            logger.warning(f"Failed to retrieve NDTwin packet counters: {exc}")
+            return host.name, {"recv_pkts": -1, "drop_pkts": -1}
+
+    return None
+
+def _get_smartnic_packet_counters() -> Optional[Tuple[str, Dict[str, int]]]:
+    """Retrieve received packet counters from the SmartNIC."""
+    hosts = NTG_CONFIG.filter(
+        F(groups__contains="get_smartnic_recv_pkt")
+    ).inventory.hosts.values()
+
+    for host in hosts:
+        try:
+            response = requests.get(
+                host.get("get_recv_pkt_url"),
+                timeout=PACKET_COUNTER_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            counters = response.json()
+            devices = counters["devices"]
+            return host.name, {
+                "device_0": int(devices["0"]),
+                "device_1": int(devices["1"]),
+                "total": int(counters["total"]),
+            }
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            logger.warning(f"Failed to retrieve SmartNIC packet counters: {exc}")
+            return host.name, {"device_0": -1, "device_1": -1, "total": -1}
+
+    return None
+
+def _get_p4_packet_counters() -> Optional[Tuple[str, Dict[str, int]]]:
+    """Run the local BFRT helper and retrieve P4 transmit counters."""
+    hosts = NTG_CONFIG.filter(
+        F(groups__contains="get_p4_send_pkt")
+    ).inventory.hosts.values()
+    script_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "Utilis",
+        "p4_packet_counter.py",
+    )
+
+    for host in hosts:
+        dev_ports = host.get("p4_dev_ports") or []
+        counter_names = [
+            f"dev_port_{port}_{name}"
+            for port in dev_ports
+            for name in ("tx_ok", "tx_all", "tx_error")
+        ]
+        counter_names.extend(
+            f"total_{name}" for name in ("tx_ok", "tx_all", "tx_error")
+        )
+        try:
+            command = [
+                "/home/gateway2/anaconda3/envs/NTG/bin/python3",
+                script_path,
+                "--switch",
+                host.get("p4_switch_address"),
+                "--dev-ports",
+                *[str(port) for port in dev_ports],
+                "--client-id",
+                str(host.get("p4_client_id")),
+            ]
+            result = subprocess.run(
+                command,
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=PACKET_COUNTER_TIMEOUT_SECONDS,
+            )
+            response = json.loads(result.stdout)
+            counters = {}
+            for port in dev_ports:
+                port_counters = response["devices"][str(port)]
+                for name in ("tx_ok", "tx_all", "tx_error"):
+                    counters[f"dev_port_{port}_{name}"] = int(port_counters[name])
+            for name in ("tx_ok", "tx_all", "tx_error"):
+                counters[f"total_{name}"] = int(response["total"][name])
+            return host.name, counters
+        except (
+            OSError,
+            subprocess.SubprocessError,
+            json.JSONDecodeError,
+            ValueError,
+            KeyError,
+            TypeError,
+        ) as exc:
+            logger.warning(f"Failed to retrieve P4 packet counters: {exc}")
+            return host.name, {name: -1 for name in counter_names}
+
+    return None
+
+def _packet_counter_recorder(
+    stop_event: threading.Event,
+    ready_event: threading.Event,
+    records: Dict[Tuple[str, str], List[Dict[str, int]]],
+) -> None:
+    """Record one-second packet-counter differences until requested to stop."""
+    counter_sources = (
+        (_get_ndtwin_packet_counters, "recv_pkts.csv"),
+        (_get_smartnic_packet_counters, "recv_pkts.csv"),
+        (_get_p4_packet_counters, "send_pkts.csv"),
+    )
+    previous_counters: Dict[Tuple[str, str], Dict[str, int]] = {}
+    next_sample_time = time.monotonic()
+
+    try:
+        for getter, filename in counter_sources:
+            snapshot = getter()
+            if snapshot is None:
+                continue
+
+            host_name, counters = snapshot
+            key = (host_name, filename)
+            records.setdefault(key, [])
+            if all(value >= 0 for value in counters.values()):
+                previous_counters[key] = counters
+
+        next_sample_time += PACKET_COUNTER_INTERVAL_SECONDS
+        ready_event.set()
+
+        while not stop_event.wait(max(0.0, next_sample_time - time.monotonic())):
+            for getter, filename in counter_sources:
+                snapshot = getter()
+                if snapshot is None:
+                    continue
+
+                host_name, counters = snapshot
+                key = (host_name, filename)
+                rows = records.setdefault(key, [])
+                previous = previous_counters.get(key)
+                sample_is_valid = all(value >= 0 for value in counters.values())
+
+                if (
+                    not sample_is_valid
+                    or previous is None
+                    or previous.keys() != counters.keys()
+                ):
+                    rows.append({name: -1 for name in counters})
+                else:
+                    rows.append({
+                        name: counters[name] - previous[name]
+                        for name in counters
+                    })
+
+                if sample_is_valid:
+                    previous_counters[key] = counters
+
+            next_sample_time += PACKET_COUNTER_INTERVAL_SECONDS
+    except Exception as exc:
+        logger.warning(f"Packet counter recorder stopped unexpectedly: {exc}")
+    finally:
+        ready_event.set()
+
+
+def _start_packet_counter_recorder():
+    """Start the packet-counter recorder and return its local state."""
+    stop_event = threading.Event()
+    ready_event = threading.Event()
+    records: Dict[Tuple[str, str], List[Dict[str, int]]] = {}
+    thread = threading.Thread(
+        target=_packet_counter_recorder,
+        args=(stop_event, ready_event, records),
+        name="packet-counter-recorder",
+    )
+    thread.start()
+    return stop_event, ready_event, thread, records
+
+
+def _stop_packet_counter_recorder(start_time: str, redirect_dir: str, recorder) -> None:
+    """Stop the packet-counter recorder and save all completed samples."""
+    stop_event, _ready_event, thread, records = recorder
+    stop_event.set()
+    thread.join()
+
+    for (host_name, filename), rows in records.items():
+        if not rows:
+            continue
+
+        try:
+            record_dir = os.path.join(redirect_dir, start_time, host_name, "res")
+            os.makedirs(record_dir, exist_ok=True)
+            pd.DataFrame(rows).to_csv(
+                os.path.join(record_dir, filename),
+                index=False,
+            )
+        except Exception as exc:
+            logger.warning(
+                f"Failed to save packet counters for {host_name}: {exc}"
+            )
+
 def signal_handler(sig, frame):
     """
     Handle keyboard interrupt signal (SIGINT) for graceful shutdown.
@@ -249,6 +509,7 @@ async def _signal_shutdown():
     ``asyncio.run()`` can finish and the process exits cleanly.
     """
     await _handle_exit_command(leave=True)
+    _join_cpu_recorders()
     # Cancel every other task so asyncio.run() can return
     for task in asyncio.all_tasks():
         if task is not asyncio.current_task():
@@ -286,6 +547,7 @@ def command_line(net,config_file_path:str="NTG.yaml"):
     Available Commands (in custom command mode):
         flow --config <file>: Start dynamic traffic generation from JSON config.
         dist --config <file>: Start distribution-based traffic generation.
+        exp --config <file>: Run a sequence of flow configurations.
         exit: Quit the interactive mode and cleanup resources.
     """
     # == Interactive CLI or Custom Command Mode ==
@@ -353,7 +615,7 @@ def command_line(net,config_file_path:str="NTG.yaml"):
         logger.debug(config_dict)
 
         logger.info("Entering Custom Command mode...")
-        link_relationship_init(ndtwin_kernel=ndtwin_kernel)
+        link_relationship_init(ndtwin_kernel=ndtwin_kernel,worker_node_server=worker_node_server)
         
         # make keyboard interrupt trigger the ending process for latter commands.
         
@@ -364,7 +626,7 @@ def command_line(net,config_file_path:str="NTG.yaml"):
     except KeyboardInterrupt:
         return
 
-def link_relationship_init(ndtwin_kernel=None):
+def link_relationship_init(ndtwin_kernel=None,worker_node_server:Optional[Dict[str,Any]]=None):
     """
     Initialize the link relationship data structure by computing distance partitions.
     
@@ -395,7 +657,7 @@ def link_relationship_init(ndtwin_kernel=None):
     logger.info("Waiting to compute all link relationships...")
     try:
         while True:
-            CONNECTIONS,HOSTS,error = distance_partition(ndtwin_kernel=ndtwin_kernel)
+            CONNECTIONS,HOSTS,error = distance_partition(ndtwin_kernel=ndtwin_kernel,worker_node_server=worker_node_server)
             if CONNECTIONS is False and HOSTS is False:
                 logger.warning(f"{error}, retrying...")
                 time.sleep(2)
@@ -437,6 +699,7 @@ async def _run_custom_command_loop(net):
           a JSON configuration file that defines traffic intervals and parameters.
         - 'dist --config <file>': Execute distribution-based traffic generation
           using probability distributions from CSV files.
+        - 'exp --config <file>': Execute multiple flow configurations sequentially.
         - 'exit': Gracefully terminate the session and cleanup resources.
     
     Args:
@@ -475,6 +738,13 @@ async def _run_custom_command_loop(net):
                         logger.warning(f"Experiment directory creation failed: {exc}")
                     continue
 
+                if cmd == 'exp':
+                    try:
+                        await _handle_exp_command(net, args)
+                    except OSError as exc:
+                        logger.warning(f"Experiment directory creation failed: {exc}")
+                    continue
+
                 if cmd == 'dist':
                     try:
                         await _handle_dist_command(net, args)
@@ -483,7 +753,7 @@ async def _run_custom_command_loop(net):
                     continue
 
                 print(f"Unknown command: {cmd}")
-                print("Available commands: exit, flow, dist")
+                print("Available commands: exit, flow, exp, dist")
 
     except KeyboardInterrupt:
         await _handle_exit_command(leave=True)
@@ -629,7 +899,83 @@ def probability_assignment(current_traffic_config,is_dynamic=True,type_to_parame
     else:
         return distance_assignment,type_assignment,current_traffic_config.get('flow_parameters', DEFAULT_FLOW_PARAMETERS)
 
-async def _handle_flow_command(net, args):
+async def _handle_exp_command(net, args) -> bool:
+    """Run the flow configurations listed in an experiment JSON file."""
+    if "--config" not in args:
+        logger.warning("No experiment config file")
+        return False
+
+    try:
+        config_file = args[args.index("--config") + 1]
+    except (ValueError, IndexError):
+        logger.warning("No experiment config file path provided")
+        return False
+
+    if not config_file.endswith(".json"):
+        logger.warning("Experiment configuration must be a JSON file")
+        return False
+
+    try:
+        with open(config_file, "r", encoding="utf-8") as f:
+            config_data = json.load(f)
+    except OSError as exc:
+        logger.warning(f"Failed to open experiment configuration {config_file}: {exc}")
+        return False
+    except json.JSONDecodeError as exc:
+        logger.warning(f"Error decoding JSON from {config_file}: {exc}")
+        return False
+
+    if not isinstance(config_data, dict):
+        logger.warning("Experiment configuration must be a JSON object")
+        return False
+
+    flow_settings = config_data.get("flow_setting")
+    if (
+        not isinstance(flow_settings, list)
+        or not flow_settings
+        or any(
+            not isinstance(flow_config, str)
+            or not flow_config
+            or not flow_config.endswith(".json")
+            for flow_config in flow_settings
+        )
+    ):
+        logger.warning("flow_setting must be a non-empty array of JSON file paths")
+        return False
+
+    exp_times = config_data.get("exp_times")
+    if isinstance(exp_times, bool) or not isinstance(exp_times, int) or exp_times <= 0:
+        logger.warning("exp_times must be a positive integer")
+        return False
+    
+    redirect_dirs = config_data.get("redirect_dir")
+    main_folder = config_data.get("main_folder")
+
+    for flow_config,redirect_dir in zip(flow_settings, redirect_dirs):
+        logger.info(
+            f"Running flow configuration {flow_config} {exp_times} time(s)..."
+        )
+        succeeded = await _handle_flow_command(
+            net,
+            ["--config", flow_config, "--num", str(exp_times)],
+            redirect_dir=redirect_dir
+        )
+        if not succeeded:
+            logger.warning(
+                f"Stopping experiment sequence after failure in {flow_config}"
+            )
+            return False
+    
+    exp_record_dir = os.path.join("./exp_record", main_folder)
+    os.makedirs(exp_record_dir, exist_ok=True)
+    for redirect_dir in redirect_dirs:
+        if os.path.exists(redirect_dir):
+            shutil.move(redirect_dir, exp_record_dir)
+    
+    return True
+
+
+async def _handle_flow_command(net, args, redirect_dir = "./cpu_records") -> bool:
     """
     Handle the 'flow' command to execute traffic generation from a JSON configuration.
     
@@ -649,9 +995,10 @@ async def _handle_flow_command(net, args):
         args (List[str]): Command arguments. Must include:
             - '--config': Flag indicating config file follows.
             - '<filepath>': Path to JSON configuration file.
+            - '--num n': Optional argument to run the same configuration n times (for fixed traffic).
     
     Returns:
-        None
+        bool: True after every requested run completes, otherwise False.
     
     Side Effects:
         - Resets RUNNING counter to 0.
@@ -680,27 +1027,40 @@ async def _handle_flow_command(net, args):
         "packet_payload_size(bytes)": "-l"
     }
 
+
     if "--config" not in args:
         logger.warning("No config file")
-        return
+        return False
 
     try:
         config_file = args[args.index("--config") + 1]
     except (ValueError, IndexError):
         logger.warning("No config file path provided")
-        return
+        return False
 
     if not config_file.endswith(".json"):
         logger.warning("Configuration must be a JSON file")
-        return
+        return False
 
-    logger.info(f"Loading configuration from {config_file}...")
-
-    processed_intervals: List[Dict[str, Any]] = []
+    exp_num = 1
     
-    with open(config_file, "r", encoding="utf-8") as f:
+    if "--num" in args:
         try:
-            config_data = json.load(f)
+            exp_num = int(args[args.index("--num") + 1])
+        except (ValueError, IndexError):
+            logger.warning("Invalid number of experiments")
+            return False
+        if exp_num <= 0:
+            logger.warning("Number of experiments must be positive")
+            return False
+    for exp_index in range(exp_num):
+        logger.info(f"Loading configuration from {config_file}...")
+
+        processed_intervals: List[Dict[str, Any]] = []
+
+        try:
+            with open(config_file, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
 
             logger.info("Checking configuration file...")
             try:
@@ -708,128 +1068,73 @@ async def _handle_flow_command(net, args):
             except ValueError as exc:
                 logger.warning(exc)
                 IPERF = "iperf3"
-                return
+                return False
             logger.success("Configuration file is valid.")
             logger.success("Starting flow generation...")
+        except OSError as exc:
+            logger.warning(f"Failed to open flow configuration {config_file}: {exc}")
+            return False
         except json.JSONDecodeError as exc:
             logger.error(f"Error decoding JSON from {config_file}: {exc}")
-            return
+            return False
 
-    FILL_WIDTH = len(str(sim_time))
+        FILL_WIDTH = len(str(sim_time))
 
-    def get_current_config(current_time):
-        if not processed_intervals:
-            return None, None, 0
+        def get_current_config(current_time):
+            if not processed_intervals:
+                return None, None, 0
 
-        temp_interval = processed_intervals[0]
-        if current_time + 1 == temp_interval["end_time"]:
-            del processed_intervals[0]
+            temp_interval = processed_intervals[0]
+            if current_time + 1 == temp_interval["end_time"]:
+                del processed_intervals[0]
 
-        return (
-            temp_interval.get("varied_traffic"),
-            temp_interval.get("fixed_traffic"),
-            temp_interval["start_time"],
-            temp_interval["duration_seconds"]
-        )
+            return (
+                temp_interval.get("varied_traffic"),
+                temp_interval.get("fixed_traffic"),
+                temp_interval["start_time"],
+                temp_interval["duration_seconds"]
+            )
 
-    offset = 0.0
-    start_t = time.perf_counter_ns()
-    start_time = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
-    if type(INTERFACE) == MininetCommunicator:
-        FLOW_DIR = _create_exp_dir(DEFAULT_FLOW_DIR,start_time)
+        logger.info(f"Starting experiment {exp_index + 1}/{exp_num}...")
 
-    logger.info("Start time: "+start_time)
+        start_time = datetime.now().strftime("%Y-%m-%d_%H_%M_%S")
 
-    try:
-        times = 0
+        offset = 0.0
+        start_t = time.perf_counter_ns()
+        if type(INTERFACE) == MininetCommunicator:
+            FLOW_DIR = _create_exp_dir(DEFAULT_FLOW_DIR,start_time)
 
-        # start recycle ports task for APICommunicator
-        if type(INTERFACE) == APICommunicator:
-            asyncio.create_task(INTERFACE.recycle_port())
+        logger.info("Start time: "+start_time)
 
-        while times < sim_time:
-            step_time = time.perf_counter_ns()
-            current_dynamic_traffic, current_fixed_traffic, interval_start_time,fixed_traffic_duration = get_current_config(times)
+        _start_cpu_recorders(start_time,redirect_dir=redirect_dir)
+        packet_counter_recorder = None
+        interrupted = False
+        try:
+            packet_counter_recorder = _start_packet_counter_recorder()
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                packet_counter_recorder[1].wait,
+            )
+            times = 0
 
-            connections = CONNECTIONS.copy()
+            # start recycle ports task for APICommunicator
+            if type(INTERFACE) == APICommunicator:
+                asyncio.create_task(INTERFACE.recycle_port())
 
-            logger.info(f"Current simulation time pass {times} seconds")
-            
-            tasks = []
+            while times < sim_time:
+                step_time = time.perf_counter_ns()
+                current_dynamic_traffic, current_fixed_traffic, interval_start_time,fixed_traffic_duration = get_current_config(times)
 
-            if current_dynamic_traffic is not None:
-                distance_assignment, type_assignment, current_parameters = probability_assignment(
-                    current_dynamic_traffic, is_dynamic=True
-                )
+                connections = CONNECTIONS.copy()
 
-                connection_assignments = list(zip(distance_assignment, type_assignment))
+                logger.info(f"Current simulation time pass {times} seconds")
 
-                logger.debug(f"Connection assignments: {connection_assignments}")
+                tasks = []
 
-                conn_dict = connections
-                randrange = random.randrange
-                
-                async with LOCK:
-                    RUNNING += len(connection_assignments)
-                    logger.trace(f"RUNNING increased to {RUNNING}")
-
-                src_list = []
-                dst_list = []
-                parameter_list = []
-
-                for distance_name, type_name in connection_assignments:
-                    
-                    conns = conn_dict[distance_name]
-                    connect = conns[randrange(len(conns))]
-
-                    src = connect['src']['name']
-                    dst = connect['dst']['name']
-                    src_list.append(src)
-                    dst_list.append(dst)
-                    parameter = current_parameters[type_name]
-                    parameter = {name_to_parameter[name]: parameter[name] for name in parameter.keys()}
-
-                    if 'udp' in type_name:
-                        parameter['-u'] = ' '
-                        if '-l' not in parameter:
-                            parameter['-l'] = UDP_PACKET_LENGTH
-                    if 'tcp' in type_name and '-l' not in parameter:
-                        parameter['-l'] = TCP_SOCKET_WRITE_LENGTH
-                    if 'unlimited_duration' in type_name:
-                        parameter['-t'] = '0'
-
-                    parameter_list.append(parameter)
-
-                    logger.trace(f"Generating flow from {src} to {dst} with parameters {parameter}...")
-                    
-                tasks.append(
-                    INTERFACE.start_iperf_pair(
-                        net,
-                        src_list.copy(),
-                        dst_list.copy(),
-                        parameter_list.copy(),
-                        times,
-                        iperf=IPERF,
-                        flow_dir=FLOW_DIR,
-                        fill_width=FILL_WIDTH,
-                        cmd_lock=CMD_LOCK,
-                        port_command=PORT_DISCOVERY_CMD,
-                        start_time=(None if type(INTERFACE)==MininetCommunicator else start_time)
-                    )
-                )
-
-            
-            if interval_start_time == times:
-
-                # start new fixed traffic if exists.
-                if current_fixed_traffic is not None:
-                    
+                if current_dynamic_traffic is not None:
                     distance_assignment, type_assignment, current_parameters = probability_assignment(
-                        current_fixed_traffic, is_dynamic=False
+                        current_dynamic_traffic, is_dynamic=True
                     )
-
-                    logger.trace(f"Type assignment: {type_assignment}")
-                    logger.trace(f"Distance assignment: {distance_assignment}")
 
                     connection_assignments = list(zip(distance_assignment, type_assignment))
 
@@ -853,11 +1158,8 @@ async def _handle_flow_command(net, args):
 
                         src = connect['src']['name']
                         dst = connect['dst']['name']
-
-
                         src_list.append(src)
                         dst_list.append(dst)
-
                         parameter = current_parameters[type_name]
                         parameter = {name_to_parameter[name]: parameter[name] for name in parameter.keys()}
 
@@ -869,22 +1171,18 @@ async def _handle_flow_command(net, args):
                             parameter['-l'] = TCP_SOCKET_WRITE_LENGTH
                         if 'unlimited_duration' in type_name:
                             parameter['-t'] = '0'
-                        if 'limited_duration' in type_name:
-                            parameter['-t'] = parameter.get('-t',fixed_traffic_duration)
-                        
 
                         parameter_list.append(parameter)
 
                         logger.trace(f"Generating flow from {src} to {dst} with parameters {parameter}...")
 
                     tasks.append(
-                        INTERFACE.start_fixed_iperf_pair(
+                        INTERFACE.start_iperf_pair(
                             net,
                             src_list.copy(),
                             dst_list.copy(),
                             parameter_list.copy(),
                             times,
-                            fixed_traffic_duration,
                             iperf=IPERF,
                             flow_dir=FLOW_DIR,
                             fill_width=FILL_WIDTH,
@@ -892,29 +1190,119 @@ async def _handle_flow_command(net, args):
                             port_command=PORT_DISCOVERY_CMD,
                             start_time=(None if type(INTERFACE)==MininetCommunicator else start_time)
                         )
-                    )            
-            
-            if tasks:
-                # Properly await all tasks to ensure they complete before moving to next time step
-                asyncio.gather(*tasks, return_exceptions=True)
+                    )
 
-            times += 1
 
-            dur_time = (1.0 - ((time.perf_counter_ns() - step_time) / 1e9)) - offset
+                if interval_start_time == times:
 
-            if dur_time > 0:
-                await asyncio.sleep(dur_time)
+                    # start new fixed traffic if exists.
+                    if current_fixed_traffic is not None:
 
-            total_time = (time.perf_counter_ns() - start_t) / 1e9
-            logger.trace(f"{(total_time)} sec pass")
-            offset = total_time - int(total_time)
+                        distance_assignment, type_assignment, current_parameters = probability_assignment(
+                            current_fixed_traffic, is_dynamic=False
+                        )
 
-        await ending_process(net)
+                        logger.trace(f"Type assignment: {type_assignment}")
+                        logger.trace(f"Distance assignment: {distance_assignment}")
 
-    except KeyboardInterrupt:
+                        connection_assignments = list(zip(distance_assignment, type_assignment))
 
-        logger.warning("Experiment interrupted by user.")
-        await ending_process(net)
+                        logger.debug(f"Connection assignments: {connection_assignments}")
+
+                        conn_dict = connections
+                        randrange = random.randrange
+
+                        async with LOCK:
+                            RUNNING += len(connection_assignments)
+                            logger.trace(f"RUNNING increased to {RUNNING}")
+
+                        src_list = []
+                        dst_list = []
+                        parameter_list = []
+
+                        for distance_name, type_name in connection_assignments:
+
+                            conns = conn_dict[distance_name]
+                            connect = conns[randrange(len(conns))]
+
+                            src = connect['src']['name']
+                            dst = connect['dst']['name']
+
+
+                            src_list.append(src)
+                            dst_list.append(dst)
+
+                            parameter = current_parameters[type_name]
+                            parameter = {name_to_parameter[name]: parameter[name] for name in parameter.keys()}
+
+                            if 'udp' in type_name:
+                                parameter['-u'] = ' '
+                                if '-l' not in parameter:
+                                    parameter['-l'] = UDP_PACKET_LENGTH
+                            if 'tcp' in type_name and '-l' not in parameter:
+                                parameter['-l'] = TCP_SOCKET_WRITE_LENGTH
+                            if 'unlimited_duration' in type_name:
+                                parameter['-t'] = '0'
+                            if 'limited_duration' in type_name:
+                                parameter['-t'] = parameter.get('-t',fixed_traffic_duration)
+
+
+                            parameter_list.append(parameter)
+
+                            logger.trace(f"Generating flow from {src} to {dst} with parameters {parameter}...")
+
+                        tasks.append(
+                            INTERFACE.start_fixed_iperf_pair(
+                                net,
+                                src_list.copy(),
+                                dst_list.copy(),
+                                parameter_list.copy(),
+                                times,
+                                fixed_traffic_duration,
+                                iperf=IPERF,
+                                flow_dir=FLOW_DIR,
+                                fill_width=FILL_WIDTH,
+                                cmd_lock=CMD_LOCK,
+                                port_command=PORT_DISCOVERY_CMD,
+                                start_time=(None if type(INTERFACE)==MininetCommunicator else start_time)
+                            )
+                        )
+
+                if tasks:
+                    # Properly await all tasks to ensure they complete before moving to next time step
+                    asyncio.gather(*tasks, return_exceptions=True)
+
+                times += 1
+
+                dur_time = (1.0 - ((time.perf_counter_ns() - step_time) / 1e9)) - offset
+
+                if dur_time > 0:
+                    await asyncio.sleep(dur_time)
+
+                total_time = (time.perf_counter_ns() - start_t) / 1e9
+                logger.trace(f"{(total_time)} sec pass")
+                offset = total_time - int(total_time)
+
+            await ending_process(net)
+
+        except KeyboardInterrupt:
+
+            logger.warning("Experiment interrupted by user.")
+            interrupted = True
+            await ending_process(net)
+        finally:
+            if packet_counter_recorder is not None:
+                _stop_packet_counter_recorder(start_time, redirect_dir, packet_counter_recorder)
+            _join_cpu_recorders()
+
+        await asyncio.sleep(20)
+        if type(INTERFACE) == APICommunicator:
+            # Reset the communicator for reuse
+            INTERFACE.reset_for_new_experiment()
+        if interrupted:
+            return False
+
+    return True
 
 async def _handle_dist_command(net, args):
     """

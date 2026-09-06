@@ -11,6 +11,7 @@ from loguru import logger
 from nornir.core.task import Task, Result
 import paramiko
 import time
+import json
 
 _DURATION_KEY = "interval_duration(d/h/m/s)"
 
@@ -166,7 +167,7 @@ def _format_duration(seconds):
         if remaining_hours > 0:
             result += f" {remaining_hours}h"
         return result
-
+    
 def collect_api_info(task: Task) -> Result:
     """
     Task to collect and store API server information from inventory.
@@ -474,6 +475,59 @@ def execute_ssh_command(hostname, username, password, port, command, timeout=30)
         if ssh_client:
             ssh_client.close()
 
+def record_cpu_usage(host, start_time, results, record_dir="./cpu_records"):
+    """Run get_cpu on one remote host and copy its two CSV records locally."""
+    ssh_client = None
+    sftp_client = None
+    try:
+        command = host.get("cpu_recorder_command", None)
+        if not command:
+            raise ValueError("cpu_recorder_command is not configured")
+
+        ssh_client = paramiko.SSHClient()
+        ssh_client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh_client.connect(
+            hostname=host.hostname,
+            username=host.username,
+            password=host.password,
+            port=host.port or 22,
+            timeout=10,
+            look_for_keys=False,
+            allow_agent=False,
+        )
+
+        _stdin, stdout, stderr = ssh_client.exec_command(command)
+        exit_status = stdout.channel.recv_exit_status()
+        output = stdout.read().decode("utf-8", errors="replace")
+        error = stderr.read().decode("utf-8", errors="replace")
+        if exit_status != 0:
+            raise RuntimeError(error.strip() or f"get_cpu exited with {exit_status}")
+
+        # logger.info(f"CPU usage recorded for {host.name}: {output.strip()}")
+        record_paths = json.loads(output.strip())
+        remote_files = [
+            record_paths["per_core_csv"],
+            record_paths["whole_host_csv"],
+        ]
+
+        local_dir = os.path.join(record_dir, start_time, host.name, "res")
+        os.makedirs(local_dir, exist_ok=True)
+        sftp_client = ssh_client.open_sftp()
+        local_files = []
+        for remote_file in remote_files:
+            local_file = os.path.join(local_dir, os.path.basename(remote_file))
+            sftp_client.get(remote_file, local_file)
+            local_files.append(local_file)
+
+        results[host.name] = {"status": "success", "files": local_files}
+    except Exception as e:
+        results[host.name] = {"status": "failed", "error": str(e)}
+    finally:
+        if sftp_client:
+            sftp_client.close()
+        if ssh_client:
+            ssh_client.close()
+
 def execute_command(task: Task,mode: int) -> Result:
     """
     Main task to execute startup commands on remote hosts via SSH using Paramiko.
@@ -532,7 +586,7 @@ def execute_command(task: Task,mode: int) -> Result:
         if result['status'] == 'success':
             logger.info(f"[{task.host.name}] Command completed successfully")
         else:
-            logger.error(f"[{task.host.name}] Command failed: {result['error']}")
+            logger.warning(f"[{task.host.name}] Command failed: {result['error']}")
         
         # Small delay between commands
         time.sleep(0.1)

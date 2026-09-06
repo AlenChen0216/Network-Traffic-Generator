@@ -11,6 +11,7 @@ import json
 from collections import deque
 import ipaddress
 import numpy as np
+from typing import Any, Dict, Optional
 
 GET_HOSTS = ""
 GET_PATHS = ""
@@ -33,7 +34,6 @@ def get_hosts():
                             ip_str = str(ipaddress.IPv4Address(host.to_bytes(4, 'little', signed=False)))
                         else:
                             ip_str = str(ipaddress.ip_address(host))
-
                         device_name = f"h{ (int(node['device_name'][1:])-1)*(len(node['ip'])) + (i+1) }"
                         hosts.update({ip_str: device_name})
                         
@@ -42,7 +42,7 @@ def get_hosts():
     except Exception:
         return [-1]
 
-def distance_partition(hosts = None, ndtwin_kernel=None):
+def distance_partition(hosts = None, ndtwin_kernel=None, worker_node_server:Optional[Dict[str,Any]]=None):
     """
     Partition the unique paths array to {near,middle,far} set.
     """
@@ -59,13 +59,15 @@ def distance_partition(hosts = None, ndtwin_kernel=None):
         return False,False,"Failed to get hosts from NDTwin server."
     
     unique_paths = {}
-
+    host_names = worker_node_server['hosts_name_map'] if worker_node_server is not None else None
     # get all paths from api.
     response = requests.get(GET_PATHS)
     if response.status_code == 200:
         response = json.loads(response.text)
         paths = response["data"]
         for path in paths:
+            if host_names is not None and hosts[path["src_ip"]] not in host_names or hosts[path["dst_ip"]] not in host_names:
+                continue
             client = {"ip":path["src_ip"],"name":hosts[path["src_ip"]]}
             server = {"ip":path["dst_ip"],"name":hosts[path["dst_ip"]]}
             switch_count = path["switch_count"]
